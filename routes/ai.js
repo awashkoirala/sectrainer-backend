@@ -5,6 +5,7 @@ const { requireAuth } = require('../middleware/auth');
 const router = express.Router();
 
 const MAX_REQUESTS_PER_HOUR = 30;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 
 async function isRateLimited(userId) {
   const result = await pool.query(
@@ -22,6 +23,10 @@ router.post('/explain', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'question, officialExplanation, and userContext are required' });
   }
 
+  if (!process.env.GEMINI_API_KEY) {
+    return res.status(503).json({ error: 'The AI tutor isn\'t configured on this server yet (missing GEMINI_API_KEY).' });
+  }
+
   if (await isRateLimited(req.userId)) {
     return res.status(429).json({ error: 'You\'ve hit the hourly limit for AI explanations. Try again soon.' });
   }
@@ -36,29 +41,25 @@ Respond with plain text only, no markdown headers.`;
   const userMsg = `Question: ${question}\nOfficial explanation: ${officialExplanation}\n${userContext}\n\nExplain this differently so it clicks for them.`;
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+    const response = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 500,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userMsg }]
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: 'user', parts: [{ text: userMsg }] }],
+        generationConfig: { maxOutputTokens: 400, temperature: 0.7 }
       })
     });
 
     if (!response.ok) {
       const errText = await response.text();
-      console.error('Anthropic API error:', response.status, errText);
+      console.error('Gemini API error:', response.status, errText);
       return res.status(502).json({ error: 'The AI tutor is unavailable right now. Try again shortly.' });
     }
 
     const data = await response.json();
-    const text = (data.content || []).map(c => c.text || '').join('\n').trim();
+    const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('\n').trim();
 
     await pool.query(`INSERT INTO ai_requests (user_id) VALUES ($1)`, [req.userId]);
 
